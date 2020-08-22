@@ -9,17 +9,12 @@ set(CXX_EXTENSIONS OFF)
 ################# source config #################
 file(GLOB SRC_LIST "*.cpp")
 
-################# library config #################
-# OpenCV
-find_package(OpenCV REQUIRED)
-include_directories( ${OpenCV_INCLUDE_DIRS} )
-
 ################# create executable app #################
 add_executable(${PROJECT_NAME} ${SRC_LIST})
 
 ################# link connect #################
-# OpenCV
-target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
+# pthread
+target_link_libraries(${PROJECT_NAME} pthread)
 
 
 

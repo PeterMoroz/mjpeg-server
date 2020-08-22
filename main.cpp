@@ -3,12 +3,10 @@
 
 #include <chrono>
 #include <iostream>
-#include <thread>
-
-#include <opencv2/opencv.hpp>
 
 
 #include "mjpeg-server.h"
+#include "v4l2-camera.h"
 
 
 sig_atomic_t needExit = 0;
@@ -21,46 +19,24 @@ int main(int argc, char* argv[])
 	unsigned framesCount = 0;
 	
 	try
-	{	
-		cv::VideoCapture vc;
-		unsigned openCount = 0;
-		static const unsigned MAX_OPEN_COUNT = 5;
-		while (openCount < MAX_OPEN_COUNT)
-		{
-			if (vc.open(0))
-			{
-				break;
-			}
-			std::cout << "Could not open video capture device. "
-				" Waiting for 100 ms ..." << std::endl;
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			openCount += 1;
-		}
+	{
+		V4L2Camera v4l2Camera;
 		
-		if (!vc.isOpened())
-		{
-			std::cerr << "Could not open video capture device. " << std::endl;
-			std::exit(EXIT_FAILURE);
-		}
-		
+		v4l2Camera.openDevice("/dev/video0");
+		v4l2Camera.printCapabilities();
+		v4l2Camera.setupCaptureFormat();
+		v4l2Camera.setupCaptureBuffer();
+				
 		MJPEGServer mjpegServer(8090);
 		
 		mjpegServer.start();
 
 		while (!needExit)
 		{
-			if (!vc.isOpened())
-			{
-				std::cerr << "Video capture device is lost." << std::endl;
-				break;	// TO DO: reconnect
-			}
-			
-			cv::Mat frame;
-			vc >> frame;
+			std::vector<unsigned char> frame = v4l2Camera.captureFrame();			
 			mjpegServer.putFrame(frame);
-			frame.release();
-		}
-	
+		}		
+		
 		mjpegServer.stop();		
 	}
 	catch (const std::exception& ex)

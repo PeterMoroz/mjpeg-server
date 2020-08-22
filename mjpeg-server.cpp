@@ -7,6 +7,7 @@
 
 #include <unistd.h>
 
+#include <cassert>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -16,11 +17,9 @@
 #include <thread>
 
 
-#include <opencv2/opencv.hpp>
-
 const std::size_t MJPEGServer::MAX_CLIENTS_CONNECTIONS = 16;
 const std::size_t MJPEGServer::MAX_QUEUED_FRAMES = 8;
-const int MJPEGServer::DEFAULT_JPEG_QUALITY = 90;
+
 
 MJPEGServer::MJPEGServer(unsigned short port)
 	: _port(port)
@@ -93,21 +92,9 @@ void MJPEGServer::stop()
 	_clients.clear();
 }
 
-void MJPEGServer::putFrame(const cv::Mat& frame)
+void MJPEGServer::putFrame(const std::vector<unsigned char>& frame)
 {
-	std::vector<unsigned char> payload;
-	
-	std::vector<int> params;
-	params.push_back(cv::IMWRITE_JPEG_QUALITY);
-	params.push_back(DEFAULT_JPEG_QUALITY);
-	cv::imencode(".jpg", frame, payload, params);
-	
-	if (payload.empty())
-	{
-		std::lock_guard<std::mutex> lg(_outMutex);
-		std::cerr << "JPEG encode failed." << std::endl;
-		return;
-	}
+	assert(!frame.empty());
 	
 	std::lock_guard<std::mutex> lg(_payloadsMutex);
 	while (_payloads.size() > MAX_QUEUED_FRAMES)
@@ -115,7 +102,7 @@ void MJPEGServer::putFrame(const cv::Mat& frame)
 		_payloads.pop_front();
 	}
 	
-	_payloads.emplace_back(payload);	
+	_payloads.emplace_back(frame);
 }
 
 void MJPEGServer::listenWorker()

@@ -7,17 +7,10 @@
 #include <vector>
 
 
-namespace cv
-{
-	class Mat;
-}
-
-
 class MJPEGServer final
 {
 	static const std::size_t MAX_CLIENTS_CONNECTIONS;
 	static const std::size_t MAX_QUEUED_FRAMES;
-	static const int DEFAULT_JPEG_QUALITY;
 	
 public:
 	MJPEGServer(const MJPEGServer&) = delete;
@@ -28,7 +21,7 @@ public:
 	
 	void start();
 	void stop();
-	void putFrame(const cv::Mat& frame);
+	void putFrame(const std::vector<unsigned char>& frame);
 	
 private:
 	void listenWorker();
