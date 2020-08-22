@@ -1,7 +1,7 @@
 #include <csignal>
+#include <cstring>
 #include <cstdlib>
 
-#include <chrono>
 #include <iostream>
 
 
@@ -11,12 +11,35 @@
 
 sig_atomic_t needExit = 0;
 
+static void sighandler(int signum)
+{
+	if (signum == SIGINT || signum == SIGTERM)
+	{
+		needExit = 1;
+	}
+}
+
 
 int main(int argc, char* argv[])
 {
 	// TO DO: setup signals: SIGINT, SIGTERM, ignore SIGPIPE
 	
-	unsigned framesCount = 0;
+	struct sigaction sigact;
+	memset(&sigact, 0, sizeof(sigact));
+	
+	sigact.sa_handler = sighandler;
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGINT);
+	sigaddset(&sigset, SIGTERM);
+	sigact.sa_mask = sigset;
+	int rc = -1;
+	rc = sigaction(SIGINT, &sigact, NULL);
+	rc = sigaction(SIGTERM, &sigact, NULL);
+	
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGPIPE);
+	rc = sigprocmask(SIG_BLOCK, &sigset, NULL);
 	
 	try
 	{
@@ -33,11 +56,15 @@ int main(int argc, char* argv[])
 
 		while (!needExit)
 		{
-			std::vector<unsigned char> frame = v4l2Camera.captureFrame();			
-			mjpegServer.putFrame(frame);
-		}		
+			std::vector<unsigned char> frame = v4l2Camera.captureFrame();
+			if (!frame.empty())
+			{
+				mjpegServer.putFrame(frame);
+			}
+		}
 		
-		mjpegServer.stop();		
+		std::cout << "Stopping the server..." << std::endl;
+		mjpegServer.stop();
 	}
 	catch (const std::exception& ex)
 	{
