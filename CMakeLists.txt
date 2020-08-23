@@ -16,23 +16,5 @@ add_executable(${PROJECT_NAME} ${SRC_LIST})
 # pthread
 target_link_libraries(${PROJECT_NAME} pthread)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+################# install application #################
+install(TARGETS MJPEGServer RUNTIME DESTINATION bin)
