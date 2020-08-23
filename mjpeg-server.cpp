@@ -1,5 +1,6 @@
 #include "mjpeg-server.h"
 
+#include <fcntl.h>
 #include <netdb.h>
 
 #include <sys/types.h>
@@ -43,6 +44,15 @@ void MJPEGServer::start()
 	{
 		perror("socket()");
 		throw std::runtime_error("Could not start MJPEG server. Could not open socket.");
+	}
+	
+	if (fcntl(_sock, F_SETFL, O_NONBLOCK) == -1)
+	{
+		perror("fcntl()");
+		close(_sock);
+		_sock = -1;
+		throw std::runtime_error("Could not start MJPEG server. "
+								"Could not set nonblocking socket mode.");
 	}
 
 	struct sockaddr_in saddr;
@@ -116,57 +126,77 @@ void MJPEGServer::listenWorker()
 		header += "Connection: close\r\n";
 		header += "Content-Type: multipart/x-mixed-replace; boundary=mjpegstream\r\n\r\n";
 		
+		fd_set fds;
+		
 		while (_isRunning.test_and_set(std::memory_order_relaxed))
 		{
-			struct sockaddr_in saddr;
-			socklen_t slen = sizeof(saddr);
-			int sock = accept(_sock, (struct sockaddr*)&saddr, &slen);
-			if (sock == -1)
+			FD_ZERO(&fds);
+			FD_SET(_sock, &fds);
+			
+			struct timeval tv = { 0 };
+			tv.tv_sec = 4;
+			
+			if (select(_sock + 1, &fds, NULL, NULL, &tv) == -1)
 			{
 				std::lock_guard<std::mutex> lg(_outMutex);
-				perror("accept()");
-				std::cerr << "Could not serve client." << std::endl;
+				perror("select()");
 				continue;
 			}
 			
-			// TO DO: check the number of currently served clients,
-			// respond with error, if threshold is reached
+			if (FD_ISSET(_sock, &fds))
+			{
+				struct sockaddr_in saddr;
+				socklen_t slen = sizeof(saddr);
+				int sock = accept(_sock, (struct sockaddr*)&saddr, &slen);
+				if (sock == -1)
+				{
+					std::lock_guard<std::mutex> lg(_outMutex);
+					perror("accept()");
+					std::cerr << "Could not serve client." << std::endl;
+					continue;
+				}
+				
+				// TO DO: check the number of currently served clients,
+				// respond with error, if threshold is reached
 
-			char buffer[4096];
-			int nbytes = recv(sock, buffer, sizeof(buffer), 0);
-			if (nbytes < 0)
-			{
-				std::lock_guard<std::mutex> lg(_outMutex);
-				perror("recv()");
-				std::cerr << "Could not recv data from client's socket." << std::endl;
-				continue;
+				char buffer[4096];
+				int nbytes = recv(sock, buffer, sizeof(buffer), 0);
+				if (nbytes < 0)
+				{
+					std::lock_guard<std::mutex> lg(_outMutex);
+					perror("recv()");
+					std::cerr << "Could not recv data from client's socket." << std::endl;
+					continue;
+				}
+				
+				buffer[nbytes] = '\0';
+				
+				{
+					std::lock_guard<std::mutex> lg(_outMutex);
+					std::cout << "Client connected (sock " << sock << "). Headers:\n" << buffer << std::endl;
+					// TO DO: print endpoint of connected client
+				}
+				
+				nbytes = send(sock, header.c_str(), header.length(), 0);
+				if (nbytes < 0)
+				{
+					std::lock_guard<std::mutex> lg(_outMutex);
+					perror("send()");
+					std::cerr << "Could not send data to client's socket." << std::endl;				
+					close(sock);
+					continue;
+				}
+				
+				{
+					std::lock_guard<std::mutex> lg(_clientsMutex);
+					_clients.push_back(sock);
+				}				
 			}
-			
-			buffer[nbytes] = '\0';
-			
-			{
-				std::lock_guard<std::mutex> lg(_outMutex);
-				std::cout << "Client connected (sock " << sock << "). Headers:\n" << buffer << std::endl;
-				// TO DO: print endpoint of connected client
-			}
-			
-			nbytes = send(sock, header.c_str(), header.length(), 0);
-			if (nbytes < 0)
-			{
-				std::lock_guard<std::mutex> lg(_outMutex);
-				perror("send()");
-				std::cerr << "Could not send data to client's socket." << std::endl;				
-				close(sock);
-				continue;
-			}
-			
-			{
-				std::lock_guard<std::mutex> lg(_clientsMutex);
-				_clients.push_back(sock);
-			}
-			
+		
 			std::this_thread::sleep_for(std::chrono::microseconds(1000));
-		}		
+		}
+		
+		_isRunning.clear(std::memory_order_relaxed);
 	}
 	catch (const std::exception& ex)
 	{
@@ -208,7 +238,7 @@ void MJPEGServer::streamWorker()
 			}
 			
 			if (n != 0)
-			{				
+			{
 				std::vector<unsigned char> payload;
 				
 				{
@@ -273,6 +303,8 @@ void MJPEGServer::streamWorker()
 			
 			std::this_thread::sleep_for(std::chrono::microseconds(1000));
 		}
+		
+		_isRunning.clear(std::memory_order_relaxed);
 	}
 	catch (const std::exception& ex)
 	{
