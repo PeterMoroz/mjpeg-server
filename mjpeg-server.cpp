@@ -5,6 +5,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <unistd.h>
 
@@ -170,11 +171,13 @@ void MJPEGServer::listenWorker()
 				}
 				
 				buffer[nbytes] = '\0';
+
+				const char* cltAddrIP = inet_ntoa(saddr.sin_addr);
 				
 				{
 					std::lock_guard<std::mutex> lg(_outMutex);
-					std::cout << "Client connected (sock " << sock << "). Headers:\n" << buffer << std::endl;
-					// TO DO: print endpoint of connected client
+					std::cout << "Client connected (sock " << sock << "). IP " << cltAddrIP << std::endl;
+					std::cout << "Headers:\n" << buffer << std::endl;
 				}
 				
 				nbytes = send(sock, header.c_str(), header.length(), 0);
