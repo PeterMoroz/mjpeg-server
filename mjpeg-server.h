@@ -23,6 +23,11 @@ public:
 	void stop();
 	void putFrame(const std::vector<unsigned char>& frame);
 	
+	void setCredentials(const std::list<std::string>& credentials)
+	{
+		_credentials = credentials;
+	}
+	
 private:
 	void listenWorker();
 	void streamWorker();
@@ -34,6 +39,7 @@ private:
 	std::list<int> _clients;
 	std::list<std::vector<unsigned char>> _payloads;
 	
+	std::list<std::string> _credentials;
 	
 	std::atomic_flag _isRunning;
 	std::thread _listenWorker;

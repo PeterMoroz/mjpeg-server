@@ -1,4 +1,5 @@
 #include "mjpeg-server.h"
+#include "Base64.h"
 
 #include <fcntl.h>
 #include <netdb.h>
@@ -10,6 +11,8 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cstring>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -21,6 +24,71 @@
 
 const std::size_t MJPEGServer::MAX_CLIENTS_CONNECTIONS = 16;
 const std::size_t MJPEGServer::MAX_QUEUED_FRAMES = 8;
+
+namespace
+{
+	std::string base64Decode(const std::string& str)
+	{
+		assert(!str.empty());
+		const std::size_t numBlocks = str.length() / 4;
+		std::string res(numBlocks * 3, ' ');
+		
+		const char BASE64_ALPHABET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+		
+		std::size_t i = 0, j = 0;
+		while (i < str.length())
+		{
+			std::uint32_t y = 0;
+			std::uint8_t sz = 0;
+			for (std::size_t k = 0; k < 4; k++)
+			{
+				char x = str[i + k];
+				if (x == '=')
+				{					
+					continue;
+				}
+				
+				const char* p = std::find(std::cbegin(BASE64_ALPHABET), std::cend(BASE64_ALPHABET), x);
+				if (p == std::cend(BASE64_ALPHABET))
+				{
+					std::cerr << "Could not find '" << x << "' in base64 alphabet!" << std::endl;
+					throw std::invalid_argument("The input string contains non base64 character(s).");
+				}
+				
+				std::size_t idx = std::distance(std::cbegin(BASE64_ALPHABET), p);
+				y |= (idx & 0x3F);
+				if (k < 3)
+				{
+					y <<= 6;
+				}
+				sz += 6;
+			}
+
+			switch (sz)
+			{
+			case 24:
+			case 18:
+				res[j++] = (y >> 16) & 0x7F;
+				res[j++] = (y >> 8) & 0x7F;
+				res[j++] = y & 0x7F;
+				break;
+			case 12:
+				res[j++] = (y >> 8) & 0x7F;
+				res[j++] = y & 0x7F;
+				break;
+			case 6:
+				res[j++] = y & 0x7F;
+				break;
+			default:
+				throw std::logic_error("Wrong size of data chunk when decodind base64 string.");
+			}
+					
+			i += 4;
+		}
+		
+		return res;
+	}
+}
 
 
 MJPEGServer::MJPEGServer(unsigned short port)
@@ -120,12 +188,23 @@ void MJPEGServer::listenWorker()
 {
 	try
 	{
-		std::string header;
-		header += "HTTP/1.0 200 OK\r\n";
-		header += "Cache-Control: no-cache\r\n";
-		header += "Pragma: no-cache\r\n";
-		header += "Connection: close\r\n";
-		header += "Content-Type: multipart/x-mixed-replace; boundary=mjpegstream\r\n\r\n";
+		std::string header200;
+		header200 += "HTTP/1.0 200 OK\r\n";
+		header200 += "Cache-Control: no-cache\r\n";
+		header200 += "Pragma: no-cache\r\n";
+		header200 += "Connection: close\r\n";
+		header200 += "Content-Type: multipart/x-mixed-replace; boundary=mjpegstream\r\n\r\n";
+		
+		std::string header400;
+		header400 += "HTTP/1.0 400 Bad Request\r\n";	
+		header400 += "Connection: close\r\n";
+		header400 += "Content-Length: 0\r\n\r\n";		
+		
+		std::string header401;
+		header401 += "HTTP/1.0 401 Unauthorized\r\n";	
+		header401 += "WWW-Authenticate: Basic realm=\"Basic Auth Testing\"\r\n";
+		header401 += "Connection: close\r\n";
+		header401 += "Content-Length: 0\r\n\r\n";
 		
 		fd_set fds;
 		
@@ -180,7 +259,112 @@ void MJPEGServer::listenWorker()
 					std::cout << "Headers:\n" << buffer << std::endl;
 				}
 				
-				nbytes = send(sock, header.c_str(), header.length(), 0);
+				const char* authHeader = strstr(buffer, "Authorization: Basic ");
+				if (authHeader == NULL)
+				{
+					nbytes = send(sock, header401.c_str(), header401.length(), 0);
+					if (nbytes < 0)
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						perror("send()");
+						std::cerr << "Could not send data to client's socket." << std::endl;				
+					}
+					
+					close(sock);
+					continue;
+				}
+				
+				const char* credentialsBegin = authHeader += strlen("Authorization: Basic ");
+				const char* credentialsEnd = strstr(credentialsBegin, "\r\n");
+				if (credentialsEnd == NULL)
+				{
+					nbytes = send(sock, header400.c_str(), header400.length(), 0);
+					if (nbytes < 0)
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						perror("send()");
+						std::cerr << "Could not send data to client's socket." << std::endl;
+					}
+					
+					close(sock);
+					continue;
+				}
+				
+				std::string credentialsBase64(credentialsBegin, credentialsEnd);
+				while (credentialsBase64.length() % 4 != 0)
+				{
+					credentialsBase64.push_back('=');
+				}
+
+/*
+				try
+				{					
+					credentials = base64Decode(credentials);
+				}
+				catch (const std::exception& ex)
+				{
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						std::cerr << "Exception: " << ex.what() << std::endl;
+					}
+					
+					nbytes = send(sock, header400.c_str(), header400.length(), 0);
+					if (nbytes < 0)
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						perror("send()");
+						std::cerr << "Could not send data to client's socket." << std::endl;
+					}
+					
+					close(sock);
+					continue;					
+				}
+				* */
+				
+				std::string credentials;
+				const std::string decodeError = macaron::Base64::Decode(credentialsBase64, credentials);
+				if (!decodeError.empty())
+				{				
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						std::cerr << "An error when decoding credentials: " << decodeError 
+							<< ", base64 string is " << credentialsBase64 << std::endl;
+					}
+					
+					nbytes = send(sock, header400.c_str(), header400.length(), 0);
+					if (nbytes < 0)
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						perror("send()");
+						std::cerr << "Could not send data to client's socket." << std::endl;
+					}
+					
+					close(sock);
+					continue;
+				}
+				
+				std::list<std::string>::const_iterator it = 
+					std::find(_credentials.cbegin(), _credentials.cend(), credentials);
+				if (it == _credentials.cend())
+				{
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						std::cout << "The pair user:password is unknown " << credentials << std::endl;
+					}
+										
+					nbytes = send(sock, header401.c_str(), header401.length(), 0);
+					if (nbytes < 0)
+					{
+						std::lock_guard<std::mutex> lg(_outMutex);
+						perror("send()");
+						std::cerr << "Could not send data to client's socket." << std::endl;				
+					}
+					
+					close(sock);
+					continue;					
+				}
+				
+				nbytes = send(sock, header200.c_str(), header200.length(), 0);
 				if (nbytes < 0)
 				{
 					std::lock_guard<std::mutex> lg(_outMutex);
@@ -189,6 +373,8 @@ void MJPEGServer::listenWorker()
 					close(sock);
 					continue;
 				}
+				
+				
 				
 				{
 					std::lock_guard<std::mutex> lg(_clientsMutex);
