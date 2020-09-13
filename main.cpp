@@ -2,7 +2,10 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <fstream>
 #include <iostream>
+#include <list>
+#include <string>
 
 
 #include "mjpeg-server.h"
@@ -22,7 +25,13 @@ static void sighandler(int signum)
 
 int main(int argc, char* argv[])
 {
-	// TO DO: setup signals: SIGINT, SIGTERM, ignore SIGPIPE
+	if (argc < 2)
+	{
+		std::cerr << "usage: " << argv[0] << " <path-to-credentials-file>" << std::endl;
+		std::exit(EXIT_FAILURE);
+	}
+	
+	const char* credentialsPath = argv[1];
 	
 	struct sigaction sigact;
 	memset(&sigact, 0, sizeof(sigact));
@@ -43,15 +52,38 @@ int main(int argc, char* argv[])
 	
 	try
 	{
+		// read credentials		
+		std::ifstream ifs(credentialsPath);
+		if (!ifs)
+		{
+			std::cerr << "Could not open file: " << credentialsPath << std::endl;
+			std::exit(EXIT_FAILURE);
+		}
+		
+		std::list<std::string> credentials;
+		std::string line;
+		while (std::getline(ifs, line))
+		{
+			if (line.empty())
+			{
+				break;
+			}
+			
+			credentials.emplace_back(line);
+		}
+		
+		// setup camera
 		V4L2Camera v4l2Camera;
 		
 		v4l2Camera.openDevice("/dev/video0");
 		v4l2Camera.printCapabilities();
 		v4l2Camera.setupCaptureFormat();
 		v4l2Camera.setupCaptureBuffer();
-				
+						
 		MJPEGServer mjpegServer(8090);
+		mjpegServer.setCredentials(credentials);
 		
+		// start server
 		mjpegServer.start();
 
 		while (!needExit)
