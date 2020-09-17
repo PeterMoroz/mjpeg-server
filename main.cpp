@@ -3,6 +3,7 @@
 #include <cstdlib>
 
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <string>
@@ -10,6 +11,8 @@
 
 #include "mjpeg-server.h"
 #include "v4l2-camera.h"
+
+#include <getopt.h>
 
 
 sig_atomic_t needExit = 0;
@@ -25,14 +28,54 @@ static void sighandler(int signum)
 
 int main(int argc, char* argv[])
 {
-	if (argc < 2)
+	const char* short_options = "c::h";
+	
+	const struct option long_options[] = 
 	{
-		std::cerr << "usage: " << argv[0] << " <path-to-credentials-file>" << std::endl;
+		{ "credentials", required_argument, NULL, 'c' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+	
+	std::function<void (void)> usage = 
+		[argv]()
+		{
+			std::cout << "usage: " << argv[0] 
+				<< " --credentials <path-to-file> " << std::endl;
+		};
+	
+	int rez = -1;
+	
+	std::string credentialsPath;
+	while ((rez = getopt_long_only(argc, argv, short_options, long_options, NULL)) != -1)
+	{
+		switch (rez)
+		{
+		case 'c':
+			credentialsPath = optarg;
+			break;
+			
+		case 'h':
+			usage();
+			std::exit(EXIT_SUCCESS);
+			break;
+			
+		default:
+			std::cout << "Unknoun option '" 
+				<< static_cast<char>(rez) << "'" << std::endl;
+			usage();
+			std::exit(EXIT_FAILURE);			
+		}
+	}
+	
+	if (credentialsPath.empty())
+	{
+		std::cerr << "The path to credentials is not specified." << std::endl;
+		usage();
 		std::exit(EXIT_FAILURE);
 	}
 	
-	const char* credentialsPath = argv[1];
-	
+		
 	struct sigaction sigact;
 	memset(&sigact, 0, sizeof(sigact));
 	

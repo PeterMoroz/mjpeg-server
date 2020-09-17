@@ -1,5 +1,4 @@
 #include "mjpeg-server.h"
-#include "Base64.h"
 
 #include <fcntl.h>
 #include <netdb.h>
@@ -16,85 +15,35 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <functional>
 #include <iostream>
+#include <iomanip>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#include <openssl/md5.h>
 
 
 const std::size_t MJPEGServer::MAX_CLIENTS_CONNECTIONS = 16;
 const std::size_t MJPEGServer::MAX_QUEUED_FRAMES = 8;
-
-namespace
-{
-	std::string base64Decode(const std::string& str)
-	{
-		assert(!str.empty());
-		const std::size_t numBlocks = str.length() / 4;
-		std::string res(numBlocks * 3, ' ');
-		
-		const char BASE64_ALPHABET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-		
-		std::size_t i = 0, j = 0;
-		while (i < str.length())
-		{
-			std::uint32_t y = 0;
-			std::uint8_t sz = 0;
-			for (std::size_t k = 0; k < 4; k++)
-			{
-				char x = str[i + k];
-				if (x == '=')
-				{					
-					continue;
-				}
-				
-				const char* p = std::find(std::cbegin(BASE64_ALPHABET), std::cend(BASE64_ALPHABET), x);
-				if (p == std::cend(BASE64_ALPHABET))
-				{
-					std::cerr << "Could not find '" << x << "' in base64 alphabet!" << std::endl;
-					throw std::invalid_argument("The input string contains non base64 character(s).");
-				}
-				
-				std::size_t idx = std::distance(std::cbegin(BASE64_ALPHABET), p);
-				y |= (idx & 0x3F);
-				if (k < 3)
-				{
-					y <<= 6;
-				}
-				sz += 6;
-			}
-
-			switch (sz)
-			{
-			case 24:
-			case 18:
-				res[j++] = (y >> 16) & 0x7F;
-				res[j++] = (y >> 8) & 0x7F;
-				res[j++] = y & 0x7F;
-				break;
-			case 12:
-				res[j++] = (y >> 8) & 0x7F;
-				res[j++] = y & 0x7F;
-				break;
-			case 6:
-				res[j++] = y & 0x7F;
-				break;
-			default:
-				throw std::logic_error("Wrong size of data chunk when decodind base64 string.");
-			}
-					
-			i += 4;
-		}
-		
-		return res;
-	}
-}
 
 
 MJPEGServer::MJPEGServer(unsigned short port)
 	: _port(port)
 	, _isRunning(ATOMIC_FLAG_INIT)
 {
+	// generate opaque value for HTTP Digest authentication
+	// just arbitrary string of hex-characters	
+	_opaque.resize(32, ' ');
+	std::srand(std::time(nullptr));
+	std::generate(_opaque.begin(), _opaque.end(), 
+		[]()
+		{
+			int r = std::rand() % 16;
+			return (r >= 0 && r <= 9) ? (r + '0') : ((r - 10) + 'a');
+		});
 }
 
 MJPEGServer::~MJPEGServer()
@@ -188,24 +137,6 @@ void MJPEGServer::listenWorker()
 {
 	try
 	{
-		std::string header200;
-		header200 += "HTTP/1.0 200 OK\r\n";
-		header200 += "Cache-Control: no-cache\r\n";
-		header200 += "Pragma: no-cache\r\n";
-		header200 += "Connection: close\r\n";
-		header200 += "Content-Type: multipart/x-mixed-replace; boundary=mjpegstream\r\n\r\n";
-		
-		std::string header400;
-		header400 += "HTTP/1.0 400 Bad Request\r\n";	
-		header400 += "Connection: close\r\n";
-		header400 += "Content-Length: 0\r\n\r\n";		
-		
-		std::string header401;
-		header401 += "HTTP/1.0 401 Unauthorized\r\n";	
-		header401 += "WWW-Authenticate: Basic realm=\"Basic Auth Testing\"\r\n";
-		header401 += "Connection: close\r\n";
-		header401 += "Content-Length: 0\r\n\r\n";
-		
 		fd_set fds;
 		
 		while (_isRunning.test_and_set(std::memory_order_relaxed))
@@ -259,123 +190,45 @@ void MJPEGServer::listenWorker()
 					std::cout << "Headers:\n" << buffer << std::endl;
 				}
 				
-				const char* authHeader = strstr(buffer, "Authorization: Basic ");
-				if (authHeader == NULL)
+				const std::string authorizationHeader = getHeader(buffer, "Authorization");
+				const std::pair<std::string, std::string> methodAndUrl = getMethodAndUrl(buffer);
+				
+				if (authorizationHeader.empty())
 				{
-					nbytes = send(sock, header401.c_str(), header401.length(), 0);
-					if (nbytes < 0)
+					std::string authenticateHeader = digestAuthentication();
+					
+					if (!sendResponse(sock, 401, {{"WWW-Authenticate", authenticateHeader}, {"Content-Length", "0"} }))
 					{
 						std::lock_guard<std::mutex> lg(_outMutex);
-						perror("send()");
-						std::cerr << "Could not send data to client's socket." << std::endl;				
-					}
-					
+						std::cerr << "Could not send response via client's socket." << std::endl;
+					}					
 					close(sock);
 					continue;
 				}
 				
-				const char* credentialsBegin = authHeader += strlen("Authorization: Basic ");
-				const char* credentialsEnd = strstr(credentialsBegin, "\r\n");
-				if (credentialsEnd == NULL)
+				if (!authorization(sock, authorizationHeader, methodAndUrl.first))
 				{
-					nbytes = send(sock, header400.c_str(), header400.length(), 0);
-					if (nbytes < 0)
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						perror("send()");
-						std::cerr << "Could not send data to client's socket." << std::endl;
-					}
-					
 					close(sock);
 					continue;
 				}
-				
-				std::string credentialsBase64(credentialsBegin, credentialsEnd);
-				while (credentialsBase64.length() % 4 != 0)
+							
+				// authorized, add headers to response				
+				const std::map<std::string, std::string> headers
 				{
-					credentialsBase64.push_back('=');
-				}
-
-/*
-				try
-				{					
-					credentials = base64Decode(credentials);
-				}
-				catch (const std::exception& ex)
-				{
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						std::cerr << "Exception: " << ex.what() << std::endl;
-					}
-					
-					nbytes = send(sock, header400.c_str(), header400.length(), 0);
-					if (nbytes < 0)
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						perror("send()");
-						std::cerr << "Could not send data to client's socket." << std::endl;
-					}
-					
-					close(sock);
-					continue;					
-				}
-				* */
+					{ "Cache-Control", "no-cache" },
+					{ "Pragma", "no-cache" },
+					{ "Content-Type", "multipart/x-mixed-replace; boundary=mjpegstream" }
+				};
 				
-				std::string credentials;
-				const std::string decodeError = macaron::Base64::Decode(credentialsBase64, credentials);
-				if (!decodeError.empty())
-				{				
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						std::cerr << "An error when decoding credentials: " << decodeError 
-							<< ", base64 string is " << credentialsBase64 << std::endl;
-					}
-					
-					nbytes = send(sock, header400.c_str(), header400.length(), 0);
-					if (nbytes < 0)
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						perror("send()");
-						std::cerr << "Could not send data to client's socket." << std::endl;
-					}
-					
-					close(sock);
-					continue;
-				}
-				
-				std::list<std::string>::const_iterator it = 
-					std::find(_credentials.cbegin(), _credentials.cend(), credentials);
-				if (it == _credentials.cend())
-				{
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						std::cout << "The pair user:password is unknown " << credentials << std::endl;
-					}
-										
-					nbytes = send(sock, header401.c_str(), header401.length(), 0);
-					if (nbytes < 0)
-					{
-						std::lock_guard<std::mutex> lg(_outMutex);
-						perror("send()");
-						std::cerr << "Could not send data to client's socket." << std::endl;				
-					}
-					
-					close(sock);
-					continue;					
-				}
-				
-				nbytes = send(sock, header200.c_str(), header200.length(), 0);
-				if (nbytes < 0)
+				if (!sendResponse(sock, 200, headers))
 				{
 					std::lock_guard<std::mutex> lg(_outMutex);
-					perror("send()");
-					std::cerr << "Could not send data to client's socket." << std::endl;				
+					std::cerr << "Could not send response via client's socket." << std::endl;
 					close(sock);
 					continue;
-				}
+				}	
 				
-				
-				
+				// add socket to the list of served clients				
 				{
 					std::lock_guard<std::mutex> lg(_clientsMutex);
 					_clients.push_back(sock);
@@ -509,4 +362,372 @@ void MJPEGServer::streamWorker()
 			std::cerr << "Exception (stream worker): unknown." << std::endl;
 		}
 	}
+}
+
+std::string MJPEGServer::digestAuthentication()
+{
+	const bool STALE_NONCE = false;
+	
+	std::string authenticateHeader("Digest");
+	authenticateHeader += " realm=\"" + _realm + "\"";
+	authenticateHeader += ", nonce=\"" + generateNonce() + "\"";
+	authenticateHeader += ", stale=" + std::string(STALE_NONCE ? "true" : "false");
+	authenticateHeader += ", algorithm=MD5";
+	authenticateHeader += ", qop=\"auth\"";
+	authenticateHeader += ", opaque=\"" + _opaque + "\"";
+	
+	// std::cout << "digest auth header " << authenticateHeader << std::endl;
+
+	return authenticateHeader;	
+}
+
+bool MJPEGServer::sendResponse(int sock, int code, 
+		const std::map<std::string, std::string>& headers/* = {}*/)
+{
+	assert(sock > 0);
+	std::string response;
+	
+
+	switch (code)
+	{
+	case 200:
+		response = "HTTP/1.0 200 OK\r\n";
+		break;
+	case 400:
+		response = "HTTP/1.0 400 Bad Request\r\n";
+		break;
+	case 401:
+		response = "HTTP/1.0 401 Unauthorized\r\n";
+		break;		
+	case 404:
+		response = "HTTP/1.0 404 Not Found\r\n";
+		break;
+	default:
+		std::cerr << " The response " << code << " is not implemented yet." << std::endl;
+		assert(false);
+	}
+	
+	// add this header for all types of response
+	response += "Connection: close\r\n";
+	
+	// it's caller's responsibility to provide correct header(s)
+	for (const auto& kv : headers)
+	{
+		response += kv.first + ": " + kv.second + "\r\n";
+	}
+	response += "\r\n";
+
+	// send response
+	int nbytes = send(sock, response.c_str(), response.length(), 0);
+	if (nbytes < 0)
+	{
+		std::lock_guard<std::mutex> lg(_outMutex);
+		perror("send()");
+		return false;
+	}
+	
+	return true;
+}
+
+bool MJPEGServer::authorization(int sock, const std::string& header, const std::string& httpMethod)
+{
+	assert(sock > 0);
+	assert(!header.empty());
+	
+	// kind of authorization
+	std::size_t p = header.find_first_of(' ');
+	if (p == std::string::npos)
+	{
+		if (!sendResponse(sock, 400, {{"Content-Length", "0"}}))
+		{
+			std::lock_guard<std::mutex> lg(_outMutex);
+			std::cerr << "Could not send response via client's socket." << std::endl;
+		}
+		return false;
+	}
+	
+	const std::string authorizationKind = header.substr(0, p);
+	const std::string authorizationData = header.substr(p + 1);
+	
+	if (authorizationKind == "Digest")
+	{
+		const std::map<std::string, std::string> authData = parseAuthData(authorizationData);
+		std::function<std::string (const std::string&)> getValByKey = 
+			[&authData](const std::string& k)
+			{
+				decltype(authData)::const_iterator it = authData.find(k);
+				return it != authData.cend() ? it->second : "";
+			};
+		
+		const std::string username(getValByKey("username"));
+		std::list<std::string>::const_iterator it = 
+			std::find_if(_credentials.cbegin(), _credentials.cend(), 
+						[&username](const std::string& credentials)
+						{
+							return (credentials.compare(0, username.length(), username) == 0);
+						});
+						
+		if (it == _credentials.cend())
+		{
+			return false;
+		}		
+		
+		// TO DO: no necessary get password as substring
+		// 1. copy credentials to s1
+		// 2. get position of ':' in s1, and insert another one after
+		// 3. insert _realm between two colons
+		std::size_t p = it->find_first_of(':');
+		if (p == std::string::npos)
+		{
+			return false;
+		}
+		
+		std::string s1(username);
+		s1.push_back(':');
+		s1.append(_realm);
+		s1.push_back(':');
+		s1.append(it->substr(p + 1));	// password
+		
+		
+		// TO DO: check the opaque
+		// TO DO: check nonce (decode received nonce, 
+		// convert to seconds and compare with current time.
+		// the difference should not be greater than 3 min)
+		
+		std::function<std::string (const std::string&)> md5Hash 
+			= [](const std::string& s)
+			{
+				unsigned char digest[MD5_DIGEST_LENGTH];
+				unsigned char* src = reinterpret_cast<unsigned char*>(const_cast<char*>(s.c_str()));
+				MD5(src, s.length(), digest);
+
+				std::ostringstream oss;
+				for (size_t i = 0; i < MD5_DIGEST_LENGTH; i++)
+				{
+					unsigned char x = digest[i];
+					oss << std::hex << std::setw(2) 
+						<< std::setfill('0') << static_cast<unsigned short>(x);
+				}
+				return oss.str();
+			};
+		
+		std::string h1(md5Hash(s1));	
+
+		std::cout << "s1 = '" << s1 << "'" << std::endl;
+		std::cout << "h1 = '" << h1 << "'" << std::endl;
+		
+		std::string s2(httpMethod);
+		s2.push_back(':');
+		s2.append(getValByKey("uri"));
+			
+		std::string h2(md5Hash(s2));
+		
+		std::cout << "s2 = '" << s2 << "'" << std::endl;
+		std::cout << "h2 = '" << h2 << "'" << std::endl;		
+		
+		std::string s3(h1);
+		const std::string qop(getValByKey("qop"));
+		s3.push_back(':');
+		s3.append(getValByKey("nonce"));
+		s3.push_back(':');		
+		
+		if (!qop.empty())
+		{
+			s3.append(getValByKey("nc"));
+			s3.push_back(':');
+			s3.append(getValByKey("cnonce"));
+			s3.push_back(':');
+			s3.append(qop);
+			s3.push_back(':');
+		}
+			
+		s3.append(h2);
+		
+		std::string h3(md5Hash(s3));
+
+		// std::cout << "s3 = '" << s3 << "'" << std::endl;		
+		// std::cout << "h3 = '" << h3 << "'" << std::endl;			
+		// std::cout << "h3 = " << h3 << ", response = " << getValByKey("response") << std::endl;
+		
+		return h3 == getValByKey("response");
+	}
+	else
+	{
+		// unsupported authorization
+		if (!sendResponse(sock, 400, {{"Content-Length", "0"}}))
+		{
+			std::lock_guard<std::mutex> lg(_outMutex);
+			std::cerr << "Could not send response via client's socket." << std::endl;
+		}
+		return false;
+	}
+	
+	// unauthorized
+	if (!sendResponse(sock, 401, {{"Content-Length", "0"}}))
+	{
+		std::lock_guard<std::mutex> lg(_outMutex);
+		std::cerr << "Could not send response via client's socket." << std::endl;
+	}
+	return false;
+}
+
+std::string MJPEGServer::getHeader(const std::string& request,
+									const std::string& headerName)
+{
+	std::string headerValue;
+	
+	std::size_t p = request.find(headerName);
+	if (p != std::string::npos)
+	{
+		p += headerName.length() + 2;
+		std::size_t p1 = request.find("\r\n", p);
+		if (p1 != std::string::npos)
+		{
+			headerValue = request.substr(p, p1 - p);
+		}
+	}
+	
+	return headerValue;
+}
+
+std::pair<std::string, std::string> MJPEGServer::getMethodAndUrl(const std::string& request)
+{
+	std::string method;
+	std::string url;
+	
+	std::size_t p = request.find_first_of(' ');
+	if (p != std::string::npos)
+	{
+		method = request.substr(0, p);
+		p += 1;
+		std::size_t p1 = request.find_first_of(' ', p);
+		if (p1 != std::string::npos)
+		{
+			url = request.substr(p, p1 - p);
+		}
+	}
+
+	return {method, url};
+}
+
+std::string MJPEGServer::generateNonce()
+{
+	// the simple method:
+	// 1. get current time +3 min
+	// 2. convert to string, encode with base64
+
+/* 	
+	std::time_t now = std::time(nullptr);
+	now += 180;
+	struct tm* timeinfo = std::localtime(&now);
+	
+	std::ostringstream oss;
+	oss << timeinfo->tm_mday << '-'
+		<< timeinfo->tm_mon + 1 << '-'
+		<< timeinfo->tm_year + 1900 << ' '
+		<< timeinfo->tm_hour << ':'
+		<< timeinfo->tm_min << ':'
+		<< timeinfo->tm_sec;
+		
+	std::string nonce = macaron::Base64::Encode(oss.str());
+	while (nonce.back() == '=')
+	{
+		nonce.pop_back();
+	}
+	
+	return nonce;
+	* */
+	
+	// TO DO: return back to previos method, 
+	// when base64 implementation will be ready
+	
+	// generate nonce value for HTTP Digest authentication
+	// just arbitrary string of hex-characters	
+	std::string nonce(32, ' ');
+	std::srand(std::time(nullptr));
+	std::generate(nonce.begin(), nonce.end(), 
+		[]()
+		{
+			int r = std::rand() % 16;
+			return (r >= 0 && r <= 9) ? (r + '0') : ((r - 10) + 'a');
+		});	
+	return nonce;
+}
+
+std::map<std::string, std::string> MJPEGServer::parseAuthData(const std::string& data)
+{
+	std::map<std::string, std::string> kvData;
+	
+	std::function<std::pair<std::string, std::string>(const std::string&)> getKeyValue = 
+		[](const std::string& s)
+	{
+		std::string k, v;
+		std::size_t p = s.find_first_of('=');
+		if (p == std::string::npos)
+		{
+			return std::make_pair(k, v);
+		}
+		
+		k = s.substr(0, p);
+		p += 1;
+		
+		while (p < s.length() && s[p] == '\"')
+		{
+			p += 1;
+		}
+		
+		v = s.substr(p);		
+		while (v.back() == '\"')
+		{
+			v.pop_back();
+		}
+		
+		return std::make_pair(k, v);
+	};
+	
+	std::size_t p0 = 0, p1 = 0;
+	
+	p1 = data.find_first_of(',');
+	if (p1 == std::string::npos)
+	{
+		p1 = data.length();
+	}	
+	
+	std::size_t len = p1 - p0;
+	while (len != 0)
+	{
+		std::string tmp(data.substr(p0, len));
+		std::pair<std::string, std::string> kv = getKeyValue(tmp);
+		if (!kv.first.empty() && !kv.second.empty())
+		{
+			kvData.emplace(kv.first, kv.second);
+		}
+		
+		if (p1 == data.length())
+		{
+			break;
+		}
+		
+		p1 += 1;
+		while (p1 < data.length() && data[p1] == ' ')
+		{
+			p1 += 1;
+		}
+		
+		if (p1 == data.length())
+		{
+			break;
+		}
+		
+		p0 = p1;
+		p1 = data.find_first_of(',', p0);
+		if (p1 == std::string::npos)
+		{
+			p1 = data.length();
+		}
+		
+		len = p1 - p0;
+	}
+	
+	return kvData;
 }

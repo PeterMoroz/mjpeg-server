@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <list>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -27,19 +29,36 @@ public:
 	{
 		_credentials = credentials;
 	}
-	
+		
 private:
 	void listenWorker();
 	void streamWorker();
+	
+	std::string digestAuthentication();
+	bool sendResponse(int sock, int code, const std::map<std::string, std::string>& headers = {});
+	
+	bool authorization(int sock, const std::string& header, const std::string& httpMethod);
+	
+	static std::string getHeader(const std::string& request,
+								const std::string& headerName);								
+	// split request (the first line) into method:url:protocol. return method and url
+	static std::pair<std::string, std::string> getMethodAndUrl(const std::string& request);
+	
+	static std::string generateNonce();
+	
+	static std::map<std::string, std::string> parseAuthData(const std::string& data);
+	
 	
 private:
 	unsigned short _port = 0;
 	int _sock = -1;
 	
 	std::list<int> _clients;
-	std::list<std::vector<unsigned char>> _payloads;
+	std::list<std::vector<unsigned char>> _payloads;	
 	
 	std::list<std::string> _credentials;
+	std::string _realm = "mjpeg server";
+	std::string _opaque;
 	
 	std::atomic_flag _isRunning;
 	std::thread _listenWorker;

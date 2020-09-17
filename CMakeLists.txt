@@ -14,7 +14,7 @@ add_executable(${PROJECT_NAME} ${SRC_LIST})
 
 ################# link connect #################
 # pthread
-target_link_libraries(${PROJECT_NAME} pthread)
+target_link_libraries(${PROJECT_NAME} pthread crypto)
 
 ################# install application #################
 install(TARGETS MJPEGServer RUNTIME DESTINATION bin)
